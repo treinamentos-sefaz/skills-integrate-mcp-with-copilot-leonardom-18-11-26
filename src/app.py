@@ -5,11 +5,19 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+import hashlib
+import hmac
+import json
+import logging
 import os
 from pathlib import Path
+from typing import Annotated, Literal
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, ValidationError
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +26,58 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+logger = logging.getLogger(__name__)
+bearer = HTTPBearer(auto_error=False)
+
+
+class Account(BaseModel):
+    email: str
+    role: Literal["student", "admin"]
+    token: str
+
+
+def current_account(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+) -> Account:
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Authentication required",
+                            headers={"WWW-Authenticate": "Bearer"})
+
+    path = os.environ.get("AUTH_ACCOUNTS_FILE")
+    if not path:
+        logger.error("AUTH_ACCOUNTS_FILE is not configured")
+        raise HTTPException(status_code=503, detail="Authentication is not configured")
+
+    try:
+        with open(path, encoding="utf-8") as file:
+            data = json.load(file)
+        if not isinstance(data, list) or not data:
+            raise ValueError("Account file must contain a non-empty list")
+        accounts = [Account.model_validate(item) for item in data]
+        tokens = [account.token for account in accounts]
+        if (len(set(tokens)) != len(tokens) or
+                any(not token.isascii() or len(token) < 32 or
+                    any(char.isspace() for char in token) for token in tokens) or
+                any(not account.email.strip() or account.email != account.email.strip()
+                    for account in accounts)):
+            raise ValueError("Invalid account or duplicate token")
+    except (OSError, ValueError, ValidationError) as exc:
+        logger.error("Unable to load authentication accounts: %s", type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Authentication is unavailable") from exc
+
+    supplied_digest = hashlib.sha256(credentials.credentials.encode("utf-8")).digest()
+    for account in accounts:
+        token_digest = hashlib.sha256(account.token.encode("ascii")).digest()
+        if hmac.compare_digest(supplied_digest, token_digest):
+            return account
+    raise HTTPException(status_code=401, detail="Invalid credentials",
+                        headers={"WWW-Authenticate": "Bearer"})
+
+
+def authorize_email(account: Account, email: str) -> None:
+    if account.role == "student" and account.email.casefold() != email.strip().casefold():
+        raise HTTPException(status_code=403, detail="Students can only manage their own registration")
 
 # In-memory activity database
 activities = {
@@ -88,9 +148,19 @@ def get_activities():
     return activities
 
 
+@app.get("/auth/me")
+def get_current_account(account: Annotated[Account, Depends(current_account)]):
+    return {"email": account.email, "role": account.role}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str,
+                        account: Annotated[Account, Depends(current_account)]):
     """Sign up a student for an activity"""
+    email = email.strip()
+    authorize_email(account, email)
+    if account.role == "student":
+        email = account.email
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -99,7 +169,8 @@ def signup_for_activity(activity_name: str, email: str):
     activity = activities[activity_name]
 
     # Validate student is not already signed up
-    if email in activity["participants"]:
+    if any(participant.casefold() == email.strip().casefold()
+           for participant in activity["participants"]):
         raise HTTPException(
             status_code=400,
             detail="Student is already signed up"
@@ -111,8 +182,10 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str,
+                             account: Annotated[Account, Depends(current_account)]):
     """Unregister a student from an activity"""
+    authorize_email(account, email)
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -121,12 +194,14 @@ def unregister_from_activity(activity_name: str, email: str):
     activity = activities[activity_name]
 
     # Validate student is signed up
-    if email not in activity["participants"]:
+    participant = next((participant for participant in activity["participants"]
+                        if participant.casefold() == email.strip().casefold()), None)
+    if participant is None:
         raise HTTPException(
             status_code=400,
             detail="Student is not signed up for this activity"
         )
 
     # Remove student
-    activity["participants"].remove(email)
+    activity["participants"].remove(participant)
     return {"message": f"Unregistered {email} from {activity_name}"}

@@ -13,6 +13,22 @@
     </header>
 
     <main>
+      <section id="auth-container">
+        <h3>Sign In</h3>
+        <form id="auth-form">
+          <div class="form-group">
+            <label for="token">Personal access token:</label>
+            <input type="password" id="token" autocomplete="off" required />
+          </div>
+          <button type="submit">Sign In</button>
+        </form>
+        <div id="auth-session" class="hidden">
+          <p id="auth-identity"></p>
+          <button id="logout" type="button">Sign Out</button>
+        </div>
+        <div id="auth-message" role="status"></div>
+      </section>
+
       <section id="activities-container">
         <h3>Available Activities</h3>
         <div id="activities-list">
@@ -21,7 +37,7 @@
         </div>
       </section>
 
-      <section id="signup-container">
+      <section id="signup-container" class="hidden">
         <h3>Sign Up for an Activity</h3>
         <form id="signup-form">
           <div class="form-group">
